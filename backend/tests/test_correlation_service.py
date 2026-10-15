@@ -150,15 +150,57 @@ def test_reasons_deduplication():
         assert len(inc["reasons"]) == len(set(inc["reasons"]))
 
 
+def test_chain_merge():
+    # A shares with B, B shares with C, A and C do not share flows directly
+    # Verifies transitive / chain merging in inverted index
+    base_time = datetime(2026, 10, 15, 10, 0, 0)
+    flows = [
+        # Burst 1: flow 1 and 2
+        {"id": 1, "src_ip": "192.168.1.1", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": base_time.strftime("%d/%m/%Y %H:%M:%S"), "score": 0.9, "label": "suspicious"},
+        {"id": 2, "src_ip": "192.168.1.1", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": (base_time + timedelta(seconds=1)).strftime("%d/%m/%Y %H:%M:%S"), "score": 0.9, "label": "suspicious"},
+    ]
+    # Port scan from 10.10.10.10 touching 25 ports, including flow 2 and flow 124
+    for p in range(25):
+        fid = 2 if p == 0 else (100 + p)
+        flows.append({
+            "id": fid,
+            "src_ip": "10.10.10.10",
+            "dst_ip": "10.0.0.2",
+            "dst_port": 1000 + p,
+            "ts": (base_time + timedelta(seconds=p)).strftime("%d/%m/%Y %H:%M:%S"),
+            "score": 0.1,
+            "label": "benign",
+        })
+    # Fan-in targeting 10.0.0.99:443 from 25 sources, including flow 124
+    for s in range(25):
+        fid = 124 if s == 0 else (200 + s)
+        flows.append({
+            "id": fid,
+            "src_ip": f"172.16.2.{s}",
+            "dst_ip": "10.0.0.99",
+            "dst_port": 443,
+            "ts": (base_time + timedelta(seconds=s)).strftime("%d/%m/%Y %H:%M:%S"),
+            "score": 0.1,
+            "label": "benign",
+        })
+
+    df = pd.DataFrame(flows)
+    incidents = correlate_flows(df)
+    # The chain connects burst -> port_scan -> fan_in into a single incident
+    assert len(incidents) == 1
+    assert set(incidents[0]["kinds"]) == {"fan_in", "port_scan", "suspicious_burst"}
+
+
 def test_correlate_flows_50k_scale_performance():
-    # Build 50,000 synthetic flows to test inverted-index scaling
+    # Build 50,000 synthetic flows with HIGH CARDINALITY:
+    # 5,000 distinct source IPs, 2,000 distinct destination ports
     base_time = datetime(2026, 10, 15, 0, 0, 0)
     n = 50000
 
     timestamps = [base_time + timedelta(seconds=i % 3600) for i in range(n)]
-    src_ips = [f"192.168.{i % 250}.{(i * 7) % 250}" for i in range(n)]
-    dst_ips = [f"10.0.{i % 50}.{(i * 3) % 250}" for i in range(n)]
-    dst_ports = [(i % 1000) + 1 for i in range(n)]
+    src_ips = [f"192.168.{i % 5000 // 256}.{i % 256}" for i in range(n)]
+    dst_ips = [f"10.0.{(i * 13) % 250}.{(i * 3) % 250}" for i in range(n)]
+    dst_ports = [(i % 2000) + 1 for i in range(n)]
     scores = np.random.uniform(0.0, 0.1, size=n)
     labels = np.array(["benign"] * n, dtype=object)
 
@@ -188,6 +230,7 @@ def test_correlate_flows_50k_scale_performance():
 
     assert elapsed < 5.0, f"Correlation on 50,000 flows took {elapsed:.2f}s (expected < 5.0s)"
     assert isinstance(incidents, list)
+
 
 
 @pytest.mark.anyio

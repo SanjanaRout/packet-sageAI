@@ -3,8 +3,16 @@ from __future__ import annotations
 import logging
 from fastapi import APIRouter, HTTPException, Query, status
 
-from schemas.incident import IncidentDetailResponse, IncidentResponse
+from schemas.incident import (
+    AskIncidentRequest,
+    AskIncidentResponse,
+    FeedbackRequest,
+    FeedbackResponse,
+    IncidentDetailResponse,
+    IncidentResponse,
+)
 from services.correlation_service import correlation_service
+
 
 logger = logging.getLogger("packet_sage")
 
@@ -44,4 +52,103 @@ async def get_incident(
             detail=f"Incident '{incident_id}' not found",
         )
     return incident
+
+
+@router.post(
+    "/{incident_id}/ask",
+    response_model=AskIncidentResponse,
+    summary="Ask GenAI assistant about incident",
+    description="Synthesize evidence-only investigation summary with strict flow ID citations.",
+)
+async def ask_incident(
+    incident_id: str,
+    request: AskIncidentRequest = AskIncidentRequest(),
+) -> AskIncidentResponse:
+    from services.assistant_service import assistant_service
+    from services.llm.base import (
+        LLMAuthError,
+        LLMConfigError,
+        LLMProviderError,
+        LLMRateLimitError,
+        LLMTimeoutError,
+    )
+
+    incident = await correlation_service.get_incident_detail(incident_id=incident_id)
+    if not incident:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident '{incident_id}' not found",
+        )
+
+    try:
+        return await assistant_service.ask_incident(incident, request.question)
+    except LLMConfigError as err:
+        logger.error("LLM configuration error: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM assistant is not configured or credentials are missing.",
+        ) from None
+    except LLMAuthError as err:
+        logger.error("LLM authentication failure: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM provider authentication failed. Check credentials.",
+        ) from None
+    except LLMRateLimitError as err:
+        logger.warning("LLM rate limit: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="LLM provider rate limit exceeded. Please retry later.",
+        ) from None
+    except LLMTimeoutError as err:
+        logger.warning("LLM timeout: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="LLM provider timed out.",
+        ) from None
+    except LLMProviderError as err:
+        logger.error("LLM provider error: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM provider error encountered.",
+        ) from None
+    except Exception as exc:
+        logger.error("Unexpected error in assistant endpoint: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="An unexpected error occurred while communicating with the assistant.",
+        ) from None
+
+
+@router.post(
+    "/{incident_id}/feedback",
+    response_model=FeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record analyst decision feedback",
+    description="Record append-only analyst decision (confirmed, incorrect, inconclusive) with notes.",
+)
+async def record_feedback(
+    incident_id: str,
+    request: FeedbackRequest,
+) -> FeedbackResponse:
+    valid_decisions = {"confirmed", "incorrect", "inconclusive"}
+    decision = request.decision.lower().strip()
+    if decision not in valid_decisions:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid decision '{request.decision}'. Expected one of {sorted(valid_decisions)}.",
+        )
+
+    res = await correlation_service.add_feedback(
+        incident_id=incident_id,
+        decision=decision,
+        note=request.note,
+    )
+    if not res:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident '{incident_id}' not found",
+        )
+    return FeedbackResponse(**res)
+
 

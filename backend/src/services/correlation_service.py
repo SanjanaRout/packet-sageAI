@@ -213,5 +213,42 @@ class CorrelationService:
         incident["feedback"] = incident.get("feedback", [])
         return incident
 
+    async def add_feedback(
+        self,
+        incident_id: str,
+        decision: str,
+        note: str,
+    ) -> dict[str, Any] | None:
+        incidents_coll = mongodb.get_collection("incidents")
+        incident = await incidents_coll.find_one({"incident_id": incident_id})
+        if not incident:
+            return None
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        feedback_entry = {
+            "decision": decision,
+            "note": note,
+            "timestamp": now_iso,
+        }
+
+        # Append-only history; update latest_decision field
+        await incidents_coll.update_one(
+            {"incident_id": incident_id},
+            {
+                "$push": {"feedback": feedback_entry},
+                "$set": {"latest_decision": decision},
+            },
+        )
+        updated = await incidents_coll.find_one({"incident_id": incident_id})
+        count = len(updated.get("feedback", []))
+        return {
+            "incident_id": incident_id,
+            "decision": decision,
+            "note": note,
+            "timestamp": now_iso,
+            "feedback_count": count,
+        }
+
 
 correlation_service = CorrelationService()
+

@@ -8,11 +8,13 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
+    "anthropic>=0.125.0",
     "beanie>=2.0.1",
     "eval-type-backport>=0.4.0",
     "fastapi[standard]>=0.128.8",
     "joblib>=1.5.3",
     "motor>=3.7.1",
+    "openai>=2.48.0",
     "pandas>=2.3.3",
     "passlib[bcrypt]>=1.7.4",
     "pydantic-settings>=2.11.0",

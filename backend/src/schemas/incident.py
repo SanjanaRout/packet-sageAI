@@ -29,3 +29,36 @@ class IncidentDetailResponse(IncidentResponse):
     limit: int = Field(default=200, description="Maximum number of flow records returned")
     feedback: list[dict[str, Any]] = Field(default_factory=list, description="Analyst feedback history")
 
+
+class AskIncidentRequest(BaseModel):
+    question: str | None = Field(default=None, description="Optional specific investigation question for the assistant")
+
+
+class AskIncidentResponse(BaseModel):
+    answer: str
+    cited_flow_ids: list[int]
+    invalid_citations: list[int]
+    provider: str
+    model: str
+
+
+class FeedbackRequest(BaseModel):
+    decision: str = Field(description="Analyst decision: confirmed, incorrect, or inconclusive")
+    note: str = Field(default="", description="Analyst observations and rationale")
+
+
+class FeedbackResponse(BaseModel):
+    incident_id: str
+    decision: str
+    note: str
+    timestamp: str
+    feedback_count: int
+
+
+class LLMStatusResponse(BaseModel):
+    provider: str
+    model: str
+    base_url_host: str | None = None
+    configured: bool
+
+
