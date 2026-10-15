@@ -9,8 +9,6 @@ logger = logging.getLogger("packet_sage")
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    """Log every incoming request with method, path and status code."""
-
     async def dispatch(self, request: Request, call_next) -> Response:
         start = time.perf_counter()
         response: Response = await call_next(request)

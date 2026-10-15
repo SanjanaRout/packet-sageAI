@@ -18,7 +18,6 @@ logger = logging.getLogger("packet_sage")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup / shutdown hooks."""
     logger.info("Starting %s v%s", settings.APP_NAME, settings.APP_VERSION)
     await mongodb.connect()
     yield
@@ -26,7 +25,6 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 
-# ── Application factory ─────────────────────────────────
 def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.APP_NAME,
@@ -35,12 +33,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Middleware (order matters – outermost first)
     add_cors_middleware(app)
     app.add_middleware(TimingMiddleware)
     app.add_middleware(LoggingMiddleware)
 
-    # Routers
     app.include_router(api_router, prefix=settings.API_PREFIX)
 
     @app.get("/", include_in_schema=False)

@@ -8,7 +8,6 @@ router = APIRouter()
 
 @router.get("/")
 async def health_check():
-    """Liveness probe with MongoDB connectivity status."""
     is_ok, error = await mongodb.ping()
     db_status = "healthy" if is_ok else "unhealthy"
 

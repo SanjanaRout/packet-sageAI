@@ -8,15 +8,11 @@ T = TypeVar("T")
 
 
 class MessageResponse(BaseModel):
-    """Simple message envelope."""
-
     message: str
     detail: Any | None = None
 
 
 class PaginatedResponse(BaseModel, Generic[T]):
-    """Generic paginated response wrapper."""
-
     items: list[T]
     total: int
     page: int

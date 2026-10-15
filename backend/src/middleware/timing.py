@@ -6,8 +6,6 @@ from starlette.responses import Response
 
 
 class TimingMiddleware(BaseHTTPMiddleware):
-    """Add an X-Process-Time header to every response."""
-
     async def dispatch(self, request: Request, call_next) -> Response:
         start = time.perf_counter()
         response: Response = await call_next(request)
