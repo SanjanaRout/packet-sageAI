@@ -19,7 +19,17 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
+    MODEL_BUNDLE_PATH: str = "src/ml-models/packetsage_model.joblib"
+    MAX_UPLOAD_SIZE_MB: int = 100
+    CHUNK_SIZE_ROWS: int = 100_000
+    DB_BATCH_SIZE: int = 5_000
+    UPLOAD_DIR: str = "uploads"
+    TIMESTAMP_FORMAT: str = "%d/%m/%Y %H:%M:%S"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+
+
 
 
 settings = Settings()

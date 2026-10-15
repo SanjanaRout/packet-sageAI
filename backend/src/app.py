@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -8,6 +9,7 @@ from api.router import api_router
 from core.config import settings
 from core.database import mongodb
 from middleware import add_cors_middleware, LoggingMiddleware, TimingMiddleware
+from services.model_service import model_service
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -20,9 +22,15 @@ logger = logging.getLogger("packet_sage")
 async def lifespan(app: FastAPI):
     logger.info("Starting %s v%s", settings.APP_NAME, settings.APP_VERSION)
     await mongodb.connect()
+    try:
+        await asyncio.to_thread(model_service.load)
+    except Exception as exc:
+        logger.warning("Model bundle unavailable at startup (failed silently): %s", exc)
     yield
+
     await mongodb.disconnect()
     logger.info("Shutdown complete")
+
 
 
 def create_app() -> FastAPI:

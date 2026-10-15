@@ -10,3 +10,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# ML Models / Joblib Bundles
+*.joblib
+
+# Uploaded Files
+uploads/
+
+
