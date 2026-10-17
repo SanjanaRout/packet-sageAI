@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -19,7 +20,9 @@ from fastapi import HTTPException, UploadFile, status
 from core.config import settings
 from core.database import mongodb
 from schemas.flow import UploadResponse
+from services.baseline_service import baseline_service
 from services.model_service import ModelService
+
 
 logger = logging.getLogger("packet_sage")
 
@@ -29,6 +32,31 @@ def _find_column(candidates: list[str], available_cols: set[str]) -> str | None:
         if candidate in available_cols:
             return candidate
     return None
+
+
+def _validate_ip(val: Any) -> str | None:
+    if val is None or pd.isna(val):
+        return None
+    val_str = str(val).strip()
+    if not val_str:
+        return None
+    try:
+        ipaddress.ip_address(val_str)
+        return val_str
+    except ValueError:
+        return None
+
+
+def _validate_port(val: Any) -> int | None:
+    if val is None or pd.isna(val):
+        return None
+    try:
+        p = int(float(val))
+        if 0 <= p <= 65535:
+            return p
+        return None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def score_chunk_sync(
@@ -181,6 +209,7 @@ class FlowService:
         file: UploadFile,
         model_service: ModelService,
         upload_id: str | None = None,
+        assume_pm_business_hours: bool | None = None,
     ) -> UploadResponse:
         upload_id = upload_id or str(uuid.uuid4())
         normalized_cols, warnings = await self.validate_header(file, model_service)
@@ -198,6 +227,8 @@ class FlowService:
             invalid_rows = 0
             suspicious_rows = 0
             unusual_rows = 0
+            invalid_ip_count = 0
+            invalid_port_count = 0
 
             current_flow_id = 0
             current_row_index = 0
@@ -234,22 +265,37 @@ class FlowService:
 
                     src_ip = None
                     if src_ip_col and pd.notna(chunk_df.iat[idx, chunk_df.columns.get_loc(src_ip_col)]):
-                        src_ip = str(chunk_df.iat[idx, chunk_df.columns.get_loc(src_ip_col)]).strip()
+                        raw_src = chunk_df.iat[idx, chunk_df.columns.get_loc(src_ip_col)]
+                        src_ip = _validate_ip(raw_src)
+                        if src_ip is None and str(raw_src).strip() != "":
+                            invalid_ip_count += 1
 
                     dst_ip = None
                     if dst_ip_col and pd.notna(chunk_df.iat[idx, chunk_df.columns.get_loc(dst_ip_col)]):
-                        dst_ip = str(chunk_df.iat[idx, chunk_df.columns.get_loc(dst_ip_col)]).strip()
+                        raw_dst = chunk_df.iat[idx, chunk_df.columns.get_loc(dst_ip_col)]
+                        dst_ip = _validate_ip(raw_dst)
+                        if dst_ip is None and str(raw_dst).strip() != "":
+                            invalid_ip_count += 1
 
                     dst_port = None
                     if dst_port_col and pd.notna(chunk_df.iat[idx, chunk_df.columns.get_loc(dst_port_col)]):
-                        try:
-                            dst_port = int(float(chunk_df.iat[idx, chunk_df.columns.get_loc(dst_port_col)]))
-                        except (ValueError, TypeError):
-                            dst_port = None
+                        raw_port = chunk_df.iat[idx, chunk_df.columns.get_loc(dst_port_col)]
+                        dst_port = _validate_port(raw_port)
+                        if dst_port is None and str(raw_port).strip() != "":
+                            invalid_port_count += 1
 
                     ts = None
                     if ts_col and pd.notna(chunk_df.iat[idx, chunk_df.columns.get_loc(ts_col)]):
                         ts = str(chunk_df.iat[idx, chunk_df.columns.get_loc(ts_col)]).strip()
+
+                    flow_deviations = []
+                    if lbl == "suspicious" or is_unusual:
+                        feat_dict = {
+                            feat: chunk_df.iat[idx, chunk_df.columns.get_loc(feat)]
+                            for feat in model_service.features
+                            if feat in chunk_df.columns
+                        }
+                        flow_deviations = baseline_service.compute_flow_deviations(feat_dict, top_k=5)
 
                     flow_doc = {
                         "flow_id": current_flow_id,
@@ -263,8 +309,10 @@ class FlowService:
                         "label": lbl,
                         "unusual": is_unusual,
                         "incident_id": None,
+                        "deviations": flow_deviations,
                     }
                     db_batch.append(flow_doc)
+
 
                     if len(db_batch) >= settings.DB_BATCH_SIZE:
                         if mongodb.is_connected:
@@ -282,6 +330,17 @@ class FlowService:
             if db_batch and mongodb.is_connected:
                 await flows_coll.insert_many(db_batch, ordered=False)
 
+            if invalid_ip_count > 0:
+                warnings.append(f"{invalid_ip_count} invalid IP address(es) stored as null.")
+            if invalid_port_count > 0:
+                warnings.append(f"{invalid_port_count} invalid destination port(s) stored as null.")
+
+            effective_shift = (
+                assume_pm_business_hours
+                if assume_pm_business_hours is not None
+                else settings.ASSUME_NO_AMPM_BUSINESS_HOURS
+            )
+
             # Store upload summary document
             if mongodb.is_connected:
                 uploads_coll = mongodb.get_collection("uploads")
@@ -295,6 +354,7 @@ class FlowService:
                         "suspicious_rows": suspicious_rows,
                         "unusual_rows": unusual_rows,
                         "warnings": warnings,
+                        "assume_pm_business_hours": effective_shift,
                     }
                 )
 
@@ -312,8 +372,15 @@ class FlowService:
             if mongodb.is_connected:
                 from services.correlation_service import correlation_service
 
-                incidents, warnings = await correlation_service.correlate_upload(upload_id, warnings)
+                incidents, warnings = await correlation_service.correlate_upload(
+                    upload_id,
+                    warnings,
+                    assume_pm_business_hours=effective_shift,
+                )
                 incident_count = len(incidents)
+            else:
+                warnings.append("Database not connected; correlation skipped.")
+
 
             return UploadResponse(
                 upload_id=upload_id,

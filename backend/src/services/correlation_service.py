@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 
+from core.config import settings
 from core.database import mongodb
 from services.correlation_engine import correlate_flows
 
@@ -26,6 +27,7 @@ class CorrelationService:
         self,
         upload_id: str,
         initial_warnings: list[str] | None = None,
+        assume_pm_business_hours: bool | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         warnings = list(initial_warnings or [])
 
@@ -94,6 +96,38 @@ class CorrelationService:
             f"Parsed timestamps using format '{best_format}' "
             f"({unparseable_count} unparseable row(s) excluded from correlation)."
         )
+
+        should_shift_hours = (
+            assume_pm_business_hours
+            if assume_pm_business_hours is not None
+            else settings.ASSUME_NO_AMPM_BUSINESS_HOURS
+        )
+
+        time_shift_applied = False
+        if should_shift_hours:
+            hours = df["parsed_ts"].dt.hour
+            shift_mask = hours.between(settings.AMPM_PM_HOURS_START, settings.AMPM_PM_HOURS_END, inclusive="both")
+            shifted_count = int(shift_mask.sum())
+            if shifted_count > 0:
+                df.loc[shift_mask, "parsed_ts"] += pd.Timedelta(hours=12)
+                time_shift_applied = True
+                warnings.append(
+                    f"Assumed 12-hour PM clock for business hours {settings.AMPM_PM_HOURS_START}..{settings.AMPM_PM_HOURS_END}; "
+                    f"shifted {shifted_count} row(s) forward by 12 hours."
+                )
+
+        valid_parsed = df["parsed_ts"].dropna()
+        if not valid_parsed.empty:
+            # Per-upload hour-of-day histogram to logs
+            hour_hist = valid_parsed.dt.hour.value_counts().sort_index().to_dict()
+            logger.info("Upload %s hour-of-day histogram: %s", upload_id, hour_hist)
+
+            min_ts = valid_parsed.min()
+            max_ts = valid_parsed.max()
+            if min_ts < pd.Timestamp("2017-07-03") or max_ts > pd.Timestamp("2017-07-07 23:59:59"):
+                warnings.append(
+                    f"Warning: Parsed dates [{min_ts} to {max_ts}] fall outside expected range 2017-07-03..2017-07-07."
+                )
         df["ts"] = df["parsed_ts"]
 
         # Filter valid flows for correlation
@@ -108,7 +142,15 @@ class CorrelationService:
                 valid_df[col] = None
 
         # Run CPU-bound correlation in threadpool
-        raw_incidents = await asyncio.to_thread(correlate_flows, valid_df)
+        raw_incidents, isolated_flow_ids = await asyncio.to_thread(
+            correlate_flows,
+            valid_df,
+            scan_ports=settings.SCAN_MIN_PORTS,
+            scan_max_dst_port=settings.SCAN_MAX_DST_PORT,
+            min_burst_flows=settings.MIN_BURST_FLOWS,
+            isolated_flow_max=settings.ISOLATED_FLOW_MAX,
+            return_isolated=True,
+        )
 
         persisted_incidents: list[dict[str, Any]] = []
         incidents_coll = mongodb.get_collection("incidents")
@@ -120,6 +162,22 @@ class CorrelationService:
                 {"upload_id": upload_id},
                 {"$set": {"incident_id": None}},
             )
+
+            # Record isolated flows and time_shift_applied on upload document
+            uploads_coll = mongodb.get_collection("uploads")
+            await uploads_coll.update_one(
+                {"upload_id": upload_id},
+                {
+                    "$set": {
+                        "isolated_flagged_flows": {
+                            "flow_ids": isolated_flow_ids[:1000],
+                            "total_count": len(isolated_flow_ids),
+                        },
+                        "time_shift_applied": time_shift_applied,
+                    }
+                },
+            )
+
 
             # Persist parsed datetime objects into Mongo for valid flows
             # Convert timestamp series to native Python datetimes
@@ -154,6 +212,7 @@ class CorrelationService:
                 "reasons": list(inc["reasons"]),
                 "flow_ids": [int(fid) for fid in inc["flow_ids"]],
                 "status": "open",
+                "time_shift_applied": time_shift_applied,
                 "created_at": now_iso,
             }
 
@@ -180,6 +239,18 @@ class CorrelationService:
         cursor = incidents_coll.find(query, projection={"_id": 0}).sort("max_score", -1)
         incidents = await cursor.to_list(length=None)
         return incidents
+
+    async def get_isolated_flows(self, upload_id: str) -> dict[str, Any]:
+        uploads_coll = mongodb.get_collection("uploads")
+        doc = await uploads_coll.find_one({"upload_id": upload_id}, projection={"_id": 0, "isolated_flagged_flows": 1})
+        if not doc or "isolated_flagged_flows" not in doc:
+            return {"upload_id": upload_id, "flow_ids": [], "total_count": 0}
+        data = doc["isolated_flagged_flows"]
+        return {
+            "upload_id": upload_id,
+            "flow_ids": data.get("flow_ids", []),
+            "total_count": data.get("total_count", 0),
+        }
 
     async def get_incident_detail(
         self,

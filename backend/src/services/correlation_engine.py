@@ -38,15 +38,24 @@ def correlate_flows(
     scan_window_s=60,
     fan_in_sources=20,
     fan_in_window_s=60,
+    scan_max_dst_port=None,
+    min_burst_flows=1,
+    isolated_flow_max=0,
+    blind_classifier=False,
+    return_isolated=False,
 ):
     # df columns: id, src_ip, dst_ip, dst_port, ts, score, label ("benign"/"suspicious"/"invalid")
     df = df.copy()
+    if blind_classifier:
+        df["label"] = "benign"
+        df["score"] = 0.0
     if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
         df["ts"] = pd.to_datetime(df["ts"], dayfirst=True, errors="coerce")
     df = df.dropna(subset=["ts", "src_ip"]).sort_values("ts")
 
-
     if df.empty:
+        if return_isolated:
+            return [], []
         return []
 
     # Valid non-invalid flows for port-scan and fan-in rules
@@ -59,19 +68,32 @@ def correlate_flows(
     # Rule 2: port scan = one source touching many distinct ports in a short window
     scan_incidents = []
     if not valid_df.empty:
-        for (src, b), g in valid_df.groupby(["src_ip", "_sbin"]):
-            n = g["dst_port"].nunique()
-            if n >= scan_ports:
-                scan_incidents.append(
-                    _inc("port_scan", f"{src} contacted {n} distinct ports in {scan_window_s}s", g)
-                )
+        scan_df = valid_df
+        if scan_max_dst_port is not None:
+            scan_df = valid_df[valid_df["dst_port"].fillna(np.inf) < scan_max_dst_port]
+
+        if not scan_df.empty:
+            scan_counts = scan_df.groupby(["src_ip", "_sbin"])["dst_port"].nunique()
+            qualifying_scans = scan_counts[scan_counts >= scan_ports]
+            if not qualifying_scans.empty:
+                scan_grouped = scan_df.groupby(["src_ip", "_sbin"])
+                for key, n in qualifying_scans.items():
+                    g = scan_grouped.get_group(key)
+                    src = key[0]
+                    scan_incidents.append(
+                        _inc("port_scan", f"{src} contacted {n} distinct ports in {scan_window_s}s", g)
+                    )
 
     # Rule 3: fan-in = many sources hitting one destination/port in a short window
     fan_in_incidents = []
     if not valid_df.empty:
-        for (dst, port, b), g in valid_df.groupby(["dst_ip", "dst_port", "_fbin"]):
-            n = g["src_ip"].nunique()
-            if n >= fan_in_sources:
+        fanin_counts = valid_df.groupby(["dst_ip", "dst_port", "_fbin"])["src_ip"].nunique()
+        qualifying_fanins = fanin_counts[fanin_counts >= fan_in_sources]
+        if not qualifying_fanins.empty:
+            fanin_grouped = valid_df.groupby(["dst_ip", "dst_port", "_fbin"])
+            for key, n in qualifying_fanins.items():
+                g = fanin_grouped.get_group(key)
+                dst, port, _ = key
                 fan_in_incidents.append(
                     _inc("fan_in", f"{n} sources targeted {dst}:{port} in {fan_in_window_s}s", g)
                 )
@@ -85,12 +107,22 @@ def correlate_flows(
 
     # Rule 1: suspicious flows from one source, split when the gap exceeds gap_s
     burst_incidents = []
+    isolated_flow_ids: set[int] = set()
     s = df[df["label"] == "suspicious"]
     if not s.empty:
         for src, g in s.groupby("src_ip"):
             brk = g["ts"].diff().dt.total_seconds().fillna(np.inf) > gap_s
             for _, h in g.groupby(brk.cumsum()):
                 flow_ids = set(h["id"].tolist())
+
+                # Bursts up to isolated_flow_max are treated as isolated flows rather than incidents
+                if isolated_flow_max > 0 and len(h) <= isolated_flow_max:
+                    isolated_in_burst = flow_ids - scan_or_fanin_flow_ids
+                    isolated_flow_ids.update(isolated_in_burst)
+                    continue
+
+                if len(h) < min_burst_flows:
+                    continue
                 # Skip single-flow burst if that flow already belongs to a fan_in or port_scan incident
                 if len(flow_ids) == 1 and (flow_ids & scan_or_fanin_flow_ids):
                     continue
@@ -99,6 +131,8 @@ def correlate_flows(
     # All candidate incidents
     all_candidates = scan_incidents + fan_in_incidents + burst_incidents
     if not all_candidates:
+        if return_isolated:
+            return [], sorted(isolated_flow_ids)
         return []
 
     # Rule 4: merge incidents that share any flow using an inverted index (flow_id -> incident_id)
@@ -126,7 +160,12 @@ def correlate_flows(
 
     merged = list(incidents_by_id.values())
 
-    return [
+    all_incident_flow_ids = set()
+    for m in merged:
+        all_incident_flow_ids.update(m["flow_ids"])
+    final_isolated_flow_ids = sorted(isolated_flow_ids - all_incident_flow_ids)
+
+    result_incidents = [
         {
             "kinds": sorted(m["kinds"]),
             "start": str(m["start"]),
@@ -140,3 +179,8 @@ def correlate_flows(
         }
         for m in sorted(merged, key=lambda m: m["start"])
     ]
+
+    if return_isolated:
+        return result_incidents, final_isolated_flow_ids
+    return result_incidents
+

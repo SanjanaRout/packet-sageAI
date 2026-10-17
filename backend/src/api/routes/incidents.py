@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from fastapi import APIRouter, HTTPException, Query, status
+from typing import Any, Union
+from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from schemas.incident import (
     AskIncidentRequest,
@@ -9,8 +10,12 @@ from schemas.incident import (
     FeedbackRequest,
     FeedbackResponse,
     IncidentDetailResponse,
+    IncidentReportResponse,
     IncidentResponse,
+    IncidentsWithIsolatedResponse,
+    IsolatedFlowsResponse,
 )
+
 from services.correlation_service import correlation_service
 
 
@@ -21,15 +26,48 @@ router = APIRouter()
 
 @router.get(
     "/",
-    response_model=list[IncidentResponse],
+    response_model=Union[list[IncidentResponse], IncidentsWithIsolatedResponse],
     summary="List flagged incidents",
     description="Retrieve all flagged incidents, optionally filtered by upload_id, ordered by max_score descending.",
 )
 async def list_incidents(
     upload_id: str | None = Query(default=None, description="Filter incidents by upload_id"),
-) -> list[IncidentResponse]:
+    include_isolated: bool = Query(default=False, description="Include isolated_flagged_flows metadata in response"),
+    response: Response = None,
+) -> Any:
     incidents = await correlation_service.get_incidents(upload_id=upload_id)
+    if upload_id:
+        iso = await correlation_service.get_isolated_flows(upload_id=upload_id)
+        if response:
+            response.headers["X-Isolated-Flow-Count"] = str(iso.get("total_count", 0))
+        if include_isolated:
+            return {"incidents": incidents, "isolated_flagged_flows": iso}
     return incidents
+
+
+@router.get(
+    "/isolated",
+    response_model=IsolatedFlowsResponse,
+    summary="Get isolated flagged flows for upload",
+    description="Retrieve isolated flagged flows (burst size <= ISOLATED_FLOW_MAX) capped at 1000 with total count.",
+)
+async def get_isolated_flows(
+    upload_id: str = Query(description="Filter isolated flagged flows by upload_id"),
+) -> IsolatedFlowsResponse:
+    return await correlation_service.get_isolated_flows(upload_id=upload_id)
+
+
+@router.get(
+    "/isolated-flows",
+    response_model=IsolatedFlowsResponse,
+    summary="Get isolated flagged flows for upload",
+    description="Retrieve isolated flagged flows (burst size <= ISOLATED_FLOW_MAX) capped at 1000 with total count.",
+)
+async def get_isolated_flows_alias(
+    upload_id: str = Query(description="Filter isolated flagged flows by upload_id"),
+) -> IsolatedFlowsResponse:
+    return await correlation_service.get_isolated_flows(upload_id=upload_id)
+
 
 
 @router.get(
@@ -52,6 +90,36 @@ async def get_incident(
             detail=f"Incident '{incident_id}' not found",
         )
     return incident
+
+
+@router.get(
+    "/{incident_id}/report",
+    response_model=IncidentReportResponse,
+    summary="Get structured incident report",
+    description="Generate a structured incident report containing executive summary, observed facts, statistical feature deviations vs. benign baseline, hypotheses and uncertainties, human-in-the-loop next steps, and analyst feedback.",
+)
+@router.post(
+    "/{incident_id}/report",
+    response_model=IncidentReportResponse,
+    summary="Generate structured incident report",
+    description="Generate a structured incident report containing executive summary, observed facts, statistical feature deviations vs. benign baseline, hypotheses and uncertainties, human-in-the-loop next steps, and analyst feedback.",
+)
+async def get_incident_report(
+    incident_id: str,
+    generate_llm: bool = Query(default=False, description="Optionally enrich report with LLM synthesis"),
+) -> IncidentReportResponse:
+    from services.report_service import report_service
+
+    report = await report_service.generate_report(
+        incident_id=incident_id, generate_llm=generate_llm
+    )
+    if not report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident '{incident_id}' not found",
+        )
+    return report
+
 
 
 @router.post(

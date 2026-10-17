@@ -230,6 +230,81 @@ def test_correlate_flows_50k_scale_performance():
 
     assert elapsed < 5.0, f"Correlation on 50,000 flows took {elapsed:.2f}s (expected < 5.0s)"
     assert isinstance(incidents, list)
+    assert len(incidents) == 5
+
+
+def test_correlate_flows_50k_scans_and_fan_ins():
+    """
+    Second 50k benchmark:
+    - 200 sources scanning 30 distinct ports each (6,000 flows)
+    - 50 targets receiving fan-in from 25 sources each (1,250 flows)
+    - 42,750 background benign flows
+    Asserts expected incidents are found and measures execution time.
+    """
+    base_time = datetime(2026, 10, 15, 10, 0, 0)
+    flows = []
+    flow_id = 1
+
+    # 1. 200 sources scanning 30 ports each (6,000 flows)
+    for s in range(200):
+        src_ip = f"10.100.{s // 256}.{s % 256}"
+        dst_ip = f"192.168.100.{s}"
+        for p in range(30):
+            flows.append({
+                "id": flow_id,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "dst_port": 1000 + p,
+                "ts": base_time + timedelta(seconds=p % 30),
+                "score": 0.01,
+                "label": "benign",
+            })
+            flow_id += 1
+
+    # 2. 50 targets receiving fan-in from 25 sources (1,250 flows)
+    for t in range(50):
+        dst_ip = f"10.200.{t // 256}.{t % 256}"
+        for s in range(25):
+            flows.append({
+                "id": flow_id,
+                "src_ip": f"172.20.{t}.{s}",
+                "dst_ip": dst_ip,
+                "dst_port": 80,
+                "ts": base_time + timedelta(seconds=s % 30),
+                "score": 0.01,
+                "label": "benign",
+            })
+            flow_id += 1
+
+    # 3. Background benign flows (42,750 flows)
+    rem = 50000 - len(flows)
+    for i in range(rem):
+        flows.append({
+            "id": flow_id,
+            "src_ip": f"192.168.{2 + (i // 250)}.{i % 250}",
+            "dst_ip": f"10.1.{i % 100}.{i % 250}",
+            "dst_port": 8000 + (i % 10),
+            "ts": base_time + timedelta(seconds=60 + (i % 3500)),
+            "score": 0.005,
+            "label": "benign",
+        })
+        flow_id += 1
+
+    df = pd.DataFrame(flows)
+    assert len(df) == 50000
+
+    start_time = time.perf_counter()
+    incidents = correlate_flows(df)
+    elapsed = time.perf_counter() - start_time
+
+    port_scans = [inc for inc in incidents if "port_scan" in inc["kinds"]]
+    fan_ins = [inc for inc in incidents if "fan_in" in inc["kinds"]]
+
+    print(f"\n[BENCHMARK] 50k flows (200 scans, 50 fan-ins): elapsed={elapsed:.3f}s, incidents={len(incidents)}")
+    assert len(port_scans) == 200, f"Expected 200 port scans, got {len(port_scans)}"
+    assert len(fan_ins) == 50, f"Expected 50 fan-ins, got {len(fan_ins)}"
+    assert len(incidents) == 250
+    assert elapsed < 5.0, f"Expected < 5.0s, took {elapsed:.2f}s"
 
 
 
@@ -255,3 +330,105 @@ async def test_correlate_upload_skips_when_missing_ip_or_ts(monkeypatch):
     incidents, warnings = await service.correlate_upload("up-1")
     assert len(incidents) == 0
     assert any("Upload lacks IP or timestamp metadata; correlation skipped." in w for w in warnings)
+
+
+@pytest.mark.anyio
+async def test_assume_no_ampm_business_hours_unshifted_and_shifted(monkeypatch):
+    from core.config import settings
+    from core.database import mongodb
+
+    service = CorrelationService()
+
+    docs = [
+        {"flow_id": 1, "upload_id": "up-clock", "src_ip": "192.168.1.10", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:30", "score": 0.8, "label": "suspicious"},
+        {"flow_id": 2, "upload_id": "up-clock", "src_ip": "192.168.1.10", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:35", "score": 0.9, "label": "suspicious"},
+        {"flow_id": 3, "upload_id": "up-clock", "src_ip": "192.168.1.10", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:36", "score": 0.85, "label": "suspicious"},
+    ]
+
+    class FakeCursor:
+        async def to_list(self, length=None):
+            return docs
+
+    class FakeColl:
+        def find(self, query, projection=None):
+            return FakeCursor()
+        async def delete_many(self, *args, **kwargs):
+            pass
+        async def update_many(self, *args, **kwargs):
+            pass
+        async def update_one(self, *args, **kwargs):
+            pass
+        async def insert_one(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(mongodb, "get_collection", lambda name: FakeColl())
+
+    # 1. Flag OFF: hour remains 01
+    monkeypatch.setattr(settings, "ASSUME_NO_AMPM_BUSINESS_HOURS", False)
+    incs_off, warns_off = await service.correlate_upload("up-clock")
+    assert not any("Assumed 12-hour PM clock" in w for w in warns_off)
+    assert len(incs_off) == 1
+    assert "01:30" in incs_off[0]["start"]
+    assert incs_off[0]["time_shift_applied"] is False
+
+    # 2. Flag ON: hour 1 shifted to 13 (1:30 -> 13:30)
+    monkeypatch.setattr(settings, "ASSUME_NO_AMPM_BUSINESS_HOURS", True)
+    monkeypatch.setattr(settings, "AMPM_PM_HOURS_START", 1)
+    monkeypatch.setattr(settings, "AMPM_PM_HOURS_END", 7)
+    incs_on, warns_on = await service.correlate_upload("up-clock")
+    assert any("Assumed 12-hour PM clock" in w and "shifted 3 row(s)" in w for w in warns_on)
+    assert len(incs_on) == 1
+    assert "13:30" in incs_on[0]["start"]
+    assert incs_on[0]["time_shift_applied"] is True
+
+
+@pytest.mark.anyio
+async def test_mixed_morning_afternoon_sorting_with_clock_fix(monkeypatch):
+    from core.config import settings
+    from core.database import mongodb
+
+    service = CorrelationService()
+
+    # Flow 1-3 at 09:30 (morning), Flow 4-6 at 01:15 (afternoon missing PM tag)
+    docs = [
+        {"flow_id": 1, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 09:30", "score": 0.85, "label": "suspicious"},
+        {"flow_id": 2, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 09:31", "score": 0.85, "label": "suspicious"},
+        {"flow_id": 3, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 09:32", "score": 0.85, "label": "suspicious"},
+        {"flow_id": 4, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:15", "score": 0.85, "label": "suspicious"},
+        {"flow_id": 5, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:16", "score": 0.85, "label": "suspicious"},
+        {"flow_id": 6, "upload_id": "up-mixed", "src_ip": "10.0.0.5", "dst_ip": "10.0.0.1", "dst_port": 80, "ts": "07/07/2017 01:17", "score": 0.85, "label": "suspicious"},
+    ]
+
+    class FakeCursor:
+        async def to_list(self, length=None):
+            return docs
+
+    class FakeColl:
+        def find(self, query, projection=None):
+            return FakeCursor()
+        async def delete_many(self, *args, **kwargs):
+            pass
+        async def update_many(self, *args, **kwargs):
+            pass
+        async def update_one(self, *args, **kwargs):
+            pass
+        async def insert_one(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(mongodb, "get_collection", lambda name: FakeColl())
+
+    monkeypatch.setattr(settings, "ASSUME_NO_AMPM_BUSINESS_HOURS", True)
+    monkeypatch.setattr(settings, "AMPM_PM_HOURS_START", 1)
+    monkeypatch.setattr(settings, "AMPM_PM_HOURS_END", 7)
+
+    incs, warns = await service.correlate_upload("up-mixed")
+    # With flag ON: 09:30 is morning, 01:15 becomes 13:15
+    # Since gap between 09:30 and 13:15 is > 300s (gap_s=300), they form 2 bursts.
+    # Earliest incident start should be 09:30, second should be 13:15!
+    assert len(incs) == 2
+    starts = [inc["start"] for inc in incs]
+    assert any("09:30" in s for s in starts)
+    assert any("13:15" in s for s in starts)
+    assert sorted(starts) == starts, f"Expected chronologically sorted incidents, got {starts}"
+
+

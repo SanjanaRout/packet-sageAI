@@ -4,8 +4,8 @@ import logging
 from typing import Optional
 
 from core.config import settings
-from services.llm.anthropic_provider import AnthropicProvider
 from services.llm.base import LLMConfigError, LLMProvider
+from services.llm.manager import MultiProviderFallback, get_active_providers
 from services.llm.openai_compat import OpenAICompatProvider
 
 logger = logging.getLogger("packet_sage")
@@ -18,18 +18,10 @@ def get_llm_provider(refresh: bool = False) -> LLMProvider:
     if _cached_provider is not None and not refresh:
         return _cached_provider
 
-    provider_name = (settings.LLM_PROVIDER or "openai_compat").lower()
+    provider_name = (settings.LLM_PROVIDER or "").lower().strip()
     api_key = settings.LLM_API_KEY.get_secret_value() if settings.LLM_API_KEY else None
 
-    if provider_name == "anthropic":
-        provider = AnthropicProvider(
-            api_key=api_key,
-            model=settings.LLM_MODEL,
-            timeout=settings.LLM_TIMEOUT_SECONDS,
-            max_retries=settings.LLM_MAX_RETRIES,
-            system_as_user=settings.LLM_SYSTEM_AS_USER,
-        )
-    elif provider_name == "openai_compat":
+    if provider_name == "openai_compat":
         provider = OpenAICompatProvider(
             api_key=api_key,
             model=settings.LLM_MODEL,
@@ -38,8 +30,13 @@ def get_llm_provider(refresh: bool = False) -> LLMProvider:
             max_retries=settings.LLM_MAX_RETRIES,
             system_as_user=settings.LLM_SYSTEM_AS_USER,
         )
+    elif provider_name in ("gemini", "groq", "mistral"):
+        provider = MultiProviderFallback(preferred_provider=provider_name)
+    elif not provider_name or provider_name == "fallback":
+        # Default: repo-assistant multi-provider fallback
+        provider = MultiProviderFallback()
     else:
-        raise LLMConfigError(f"Unsupported LLM_PROVIDER '{settings.LLM_PROVIDER}'. Expected 'openai_compat' or 'anthropic'.")
+        raise LLMConfigError(f"Unsupported LLM_PROVIDER '{settings.LLM_PROVIDER}'. Expected one of 'gemini', 'groq', 'mistral', 'openai_compat'.")
 
     _cached_provider = provider
     return _cached_provider

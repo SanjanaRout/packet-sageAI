@@ -20,14 +20,37 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
     MODEL_BUNDLE_PATH: str = "src/ml-models/packetsage_model.joblib"
+    BENIGN_BASELINE_PATH: str = "src/ml-models/benign_baseline_stats.json"
     MAX_UPLOAD_SIZE_MB: int = 100
     CHUNK_SIZE_ROWS: int = 100_000
     DB_BATCH_SIZE: int = 5_000
     UPLOAD_DIR: str = "uploads"
-    TIMESTAMP_FORMAT: str = "%d/%m/%Y %H:%M:%S"
+    ASSUME_NO_AMPM_BUSINESS_HOURS: bool = False
+    AMPM_PM_HOURS_START: int = 1
+    AMPM_PM_HOURS_END: int = 7
 
-    # GenAI / LLM Settings
-    LLM_PROVIDER: str = "openai_compat"  # "openai_compat" | "anthropic"
+    # Correlation rule parameters
+    SCAN_MIN_PORTS: int = 20
+    SCAN_MAX_DST_PORT: int | None = 32768
+    MIN_BURST_FLOWS: int = 1
+    ISOLATED_FLOW_MAX: int = 2
+
+
+    # GenAI / LLM Settings (matching repo-assistant multi-provider fallback)
+    gemini_api_key: str = ""
+    gemini_llm_model: str = "gemini-3.1-flash-lite"
+
+    groq_api_key: str = ""
+    groq_llm_model: str = "llama-3.3-70b-versatile"
+
+    mistral_api_key: str = ""
+    mistral_llm_model: str = "mistral-small-latest"
+
+    # Fallback order of providers (comma separated)
+    llm_provider_order: str = "gemini,groq,mistral"
+
+    # Optional custom provider / localhost overrides
+    LLM_PROVIDER: str = ""
     LLM_API_KEY: SecretStr | None = None
     LLM_MODEL: str = "gpt-4o-mini"
     LLM_BASE_URL: str | None = None

@@ -28,3 +28,5 @@ class FlowRecord(BaseModel):
     label: str  # "benign", "suspicious", "invalid"
     unusual: bool = False
     incident_id: str | None = None
+    deviations: list[dict[str, Any]] = Field(default_factory=list, description="Top statistical deviations against benign baseline")
+

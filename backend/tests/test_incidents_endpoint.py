@@ -54,3 +54,53 @@ def test_get_incident_detail_found(monkeypatch):
 
         res404 = client.get("/api/v1/incidents/nonexistent")
         assert res404.status_code == 404
+
+
+def test_get_isolated_flows_endpoint(monkeypatch):
+    async def mock_get_isolated(upload_id):
+        return {
+            "upload_id": upload_id,
+            "flow_ids": [10, 20, 30],
+            "total_count": 3,
+        }
+
+    monkeypatch.setattr(correlation_service, "get_isolated_flows", mock_get_isolated)
+
+    with TestClient(app) as client:
+        # Test /isolated
+        res = client.get("/api/v1/incidents/isolated?upload_id=up-789")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["upload_id"] == "up-789"
+        assert data["flow_ids"] == [10, 20, 30]
+        assert data["total_count"] == 3
+
+        # Test /isolated-flows
+        res2 = client.get("/api/v1/incidents/isolated-flows?upload_id=up-789")
+        assert res2.status_code == 200
+        assert res2.json()["total_count"] == 3
+
+
+def test_list_incidents_with_include_isolated(monkeypatch):
+    async def mock_get_incidents(upload_id=None):
+        return []
+
+    async def mock_get_isolated(upload_id):
+        return {
+            "upload_id": upload_id,
+            "flow_ids": [1, 2],
+            "total_count": 2,
+        }
+
+    monkeypatch.setattr(correlation_service, "get_incidents", mock_get_incidents)
+    monkeypatch.setattr(correlation_service, "get_isolated_flows", mock_get_isolated)
+
+    with TestClient(app) as client:
+        res = client.get("/api/v1/incidents/?upload_id=up-100&include_isolated=true")
+        assert res.status_code == 200
+        data = res.json()
+        assert "incidents" in data
+        assert "isolated_flagged_flows" in data
+        assert data["isolated_flagged_flows"]["total_count"] == 2
+        assert res.headers.get("X-Isolated-Flow-Count") == "2"
+

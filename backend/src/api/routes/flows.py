@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 
 from dependencies import get_model_service
 from schemas.flow import UploadResponse
@@ -29,6 +29,8 @@ router = APIRouter()
 )
 async def upload_flows(
     file: UploadFile = File(...),
+    assume_pm_business_hours: bool | None = Query(default=None, description="Assume 12-hour PM clock for business hours 1..7"),
+    assume_pm_business_hours_form: bool | None = Form(default=None, alias="assume_pm_business_hours"),
     model_service: ModelService = Depends(get_model_service),
 ) -> UploadResponse:
     if not file.filename or not file.filename.lower().endswith(".csv"):
@@ -37,4 +39,15 @@ async def upload_flows(
             detail="File must be a CSV file (.csv)",
         )
 
-    return await flow_service.process_upload(file=file, model_service=model_service)
+    effective_shift = (
+        assume_pm_business_hours
+        if assume_pm_business_hours is not None
+        else assume_pm_business_hours_form
+    )
+
+    return await flow_service.process_upload(
+        file=file,
+        model_service=model_service,
+        assume_pm_business_hours=effective_shift,
+    )
+

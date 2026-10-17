@@ -19,6 +19,7 @@ class IncidentResponse(BaseModel):
     reasons: list[str] = Field(default_factory=list, description="Reasons for flagging the incident")
     flow_ids: list[int] = Field(default_factory=list, description="Associated flow IDs")
     status: str = Field(default="open", description="Incident status: open, closed, under_review")
+    time_shift_applied: bool = Field(default=False, description="Whether 12-hour clock shift was applied to this upload")
     created_at: str = Field(description="ISO timestamp of incident creation")
 
 
@@ -60,5 +61,72 @@ class LLMStatusResponse(BaseModel):
     model: str
     base_url_host: str | None = None
     configured: bool
+
+
+class IsolatedFlowsResponse(BaseModel):
+    upload_id: str
+    flow_ids: list[int] = Field(default_factory=list, description="Capped list of up to 1000 isolated flow IDs")
+    total_count: int = Field(default=0, description="Total count of isolated flagged flows")
+
+
+class IncidentsWithIsolatedResponse(BaseModel):
+    incidents: list[IncidentResponse]
+    isolated_flagged_flows: IsolatedFlowsResponse
+
+
+class ObservedFacts(BaseModel):
+    time_window: str = Field(description="Earliest to latest flow timestamp")
+    time_shift_applied: bool = Field(description="Whether 12-hour clock shift was applied")
+    time_metadata_note: str = Field(description="Clarification on timestamp format and shift assumptions")
+    src_ips: list[str] = Field(description="Source IP addresses")
+    dst_ips: list[str] = Field(description="Target destination IP addresses")
+    dst_ports: list[int] = Field(description="Target destination ports")
+    flow_count: int = Field(description="Total flow count for the incident")
+    rules_triggered: list[str] = Field(description="Correlation rule categories triggered")
+    reasons: list[str] = Field(description="Specific rule trigger descriptions and rationale")
+    score_min: float = Field(description="Lowest model score among evidence flows")
+    score_max: float = Field(description="Peak anomaly model score")
+    top_feature_deviations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Aggregated statistical feature deviations vs. benign baseline",
+    )
+
+
+class SupportingEvidenceFlow(BaseModel):
+    flow_id: int
+    ts: str | None = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
+    dst_port: int | None = None
+    score: float | None = None
+    label: str | None = None
+    unusual: bool = False
+    deviations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AnalystFeedbackEntry(BaseModel):
+    decision: str
+    note: str
+    timestamp: str
+
+
+class AnalystFeedbackHistory(BaseModel):
+    current_status: str
+    latest_decision: str | None = None
+    feedback_entries: list[AnalystFeedbackEntry] = Field(default_factory=list)
+
+
+class IncidentReportResponse(BaseModel):
+    incident_id: str
+    upload_id: str
+    generated_at: str
+    executive_summary: str
+    observed_facts: ObservedFacts
+    supporting_evidence: list[SupportingEvidenceFlow]
+    hypotheses_and_uncertainties: list[str]
+    recommended_next_steps: list[str]
+    analyst_feedback_history: AnalystFeedbackHistory
+
+
 
 

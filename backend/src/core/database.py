@@ -66,10 +66,24 @@ class MongoDB:
     def get_db(self) -> AsyncIOMotorDatabase:
         if self.db is None:
             raise RuntimeError("Database not initialized. Call connect() first.")
+        try:
+            import asyncio
+            current_loop = asyncio.get_running_loop()
+            if self.client:
+                client_loop = self.client.get_io_loop()
+                if client_loop != current_loop or client_loop.is_closed():
+                    self.client = AsyncIOMotorClient(
+                        settings.MONGODB_URL,
+                        serverSelectionTimeoutMS=2000,
+                    )
+                    self.db = self.client[settings.MONGODB_DB_NAME]
+        except (RuntimeError, Exception):
+            pass
         return self.db
 
     def get_collection(self, name: str):
         return self.get_db()[name]
+
 
 
 mongodb = MongoDB()
