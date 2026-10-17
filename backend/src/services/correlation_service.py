@@ -289,6 +289,8 @@ class CorrelationService:
         incident_id: str,
         decision: str,
         note: str,
+        analyst_id: str | None = None,
+        analyst_name: str | None = None,
     ) -> dict[str, Any] | None:
         incidents_coll = mongodb.get_collection("incidents")
         incident = await incidents_coll.find_one({"incident_id": incident_id})
@@ -300,14 +302,19 @@ class CorrelationService:
             "decision": decision,
             "note": note,
             "timestamp": now_iso,
+            "analyst_id": analyst_id,
+            "analyst_name": analyst_name,
         }
 
-        # Append-only history; update latest_decision field
+        # Append-only history; update status and latest_decision fields
         await incidents_coll.update_one(
             {"incident_id": incident_id},
             {
                 "$push": {"feedback": feedback_entry},
-                "$set": {"latest_decision": decision},
+                "$set": {
+                    "latest_decision": decision,
+                    "status": decision,
+                },
             },
         )
         updated = await incidents_coll.find_one({"incident_id": incident_id})
@@ -318,6 +325,8 @@ class CorrelationService:
             "note": note,
             "timestamp": now_iso,
             "feedback_count": count,
+            "analyst_id": analyst_id,
+            "analyst_name": analyst_name,
         }
 
 

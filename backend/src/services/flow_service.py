@@ -225,6 +225,9 @@ class FlowService:
             total_rows = 0
             valid_rows = 0
             invalid_rows = 0
+            malformed_rows = 0
+            incomplete_rows = 0
+            nan_inf_sanitized_records = 0
             suspicious_rows = 0
             unusual_rows = 0
             invalid_ip_count = 0
@@ -319,9 +322,20 @@ class FlowService:
                             await flows_coll.insert_many(db_batch, ordered=False)
                         db_batch = []
 
-                total_rows += chunk_len
+                # Evaluate sanitation and completeness metrics
+                X_feat = chunk_df[model_service.features].apply(pd.to_numeric, errors="coerce")
+                X_feat.replace([np.inf, -np.inf], np.nan, inplace=True)
+                missing_per_row = X_feat.isna().sum(axis=1)
+
                 inv_count = int(invalid_mask.sum())
+                inc_count = int(((missing_per_row > 0) & (~invalid_mask)).sum())
+                nan_inf_count = int((missing_per_row > 0).sum())
+
+                total_rows += chunk_len
                 invalid_rows += inv_count
+                malformed_rows += inv_count
+                incomplete_rows += inc_count
+                nan_inf_sanitized_records += nan_inf_count
                 valid_rows += (chunk_len - inv_count)
                 suspicious_rows += int((labels == "suspicious").sum())
                 unusual_rows += int(unusual.sum())
@@ -351,6 +365,9 @@ class FlowService:
                         "total_rows": total_rows,
                         "valid_rows": valid_rows,
                         "invalid_rows": invalid_rows,
+                        "malformed_rows": malformed_rows,
+                        "incomplete_rows": incomplete_rows,
+                        "nan_inf_sanitized_records": nan_inf_sanitized_records,
                         "suspicious_rows": suspicious_rows,
                         "unusual_rows": unusual_rows,
                         "warnings": warnings,
@@ -387,6 +404,9 @@ class FlowService:
                 total_rows=total_rows,
                 valid_rows=valid_rows,
                 invalid_rows=invalid_rows,
+                malformed_rows=malformed_rows,
+                incomplete_rows=incomplete_rows,
+                nan_inf_sanitized_records=nan_inf_sanitized_records,
                 suspicious_rows=suspicious_rows,
                 unusual_rows=unusual_rows,
                 warnings=warnings,
@@ -399,6 +419,9 @@ class FlowService:
                 except OSError as exc:
                     logger.warning("Could not delete temporary file %s: %s", temp_path, exc)
 
+    async def get_upload_summary(self, upload_id: str) -> dict[str, Any] | None:
+        uploads_coll = mongodb.get_collection("uploads")
+        return await uploads_coll.find_one({"upload_id": upload_id}, projection={"_id": 0})
 
 
 flow_service = FlowService()

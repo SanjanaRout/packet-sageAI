@@ -135,3 +135,48 @@ def test_upload_per_upload_clock_shift_options():
             pass
 
 
+def test_get_upload_summary_endpoint(monkeypatch):
+    from services.flow_service import flow_service
+
+    mock_doc = {
+        "upload_id": "up-summary-123",
+        "total_rows": 100,
+        "valid_rows": 95,
+        "invalid_rows": 5,
+        "malformed_rows": 5,
+        "incomplete_rows": 10,
+        "nan_inf_sanitized_records": 15,
+        "suspicious_rows": 8,
+        "unusual_rows": 3,
+        "warnings": [],
+        "incident_count": 1,
+    }
+
+    async def mock_get_upload_summary(upload_id):
+        if upload_id == "up-summary-123":
+            return mock_doc
+        return None
+
+    monkeypatch.setattr(flow_service, "get_upload_summary", mock_get_upload_summary)
+
+    with TestClient(app) as client:
+        # GET /api/v1/uploads/{upload_id}
+        res = client.get("/api/v1/uploads/up-summary-123")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["upload_id"] == "up-summary-123"
+        assert data["malformed_rows"] == 5
+        assert data["incomplete_rows"] == 10
+        assert data["nan_inf_sanitized_records"] == 15
+
+        # GET /api/v1/flows/uploads/{upload_id}
+        res_flows = client.get("/api/v1/flows/uploads/up-summary-123")
+        assert res_flows.status_code == 200
+        assert res_flows.json()["total_rows"] == 100
+
+        # Nonexistent returns 404
+        res_404 = client.get("/api/v1/uploads/nonexistent-upload")
+        assert res_404.status_code == 404
+
+
+

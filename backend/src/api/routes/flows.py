@@ -51,3 +51,20 @@ async def upload_flows(
         assume_pm_business_hours=effective_shift,
     )
 
+
+@router.get(
+    "/uploads/{upload_id}",
+    response_model=UploadResponse,
+    summary="Get upload summary",
+    description="Retrieve upload metadata, record validity counts, and sanitation metrics.",
+)
+async def get_upload_summary(upload_id: str) -> UploadResponse:
+    doc = await flow_service.get_upload_summary(upload_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload '{upload_id}' not found",
+        )
+    return UploadResponse(**doc)
+
+

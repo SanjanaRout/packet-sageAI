@@ -15,7 +15,7 @@ def test_baseline_service_extremity_and_disclaimer():
     assert len(service.stats) > 0
 
     # Destination port p50 is 80.0, p95 is ~443/8080, p99 is ~5353/8080
-    # Let's craft features with extreme values
+    # Craft features with extreme behavioral values and an identifier (Destination Port)
     extreme_features = {
         "Destination Port": 60000.0,
         "Total Fwd Packets": 5000.0,
@@ -24,6 +24,12 @@ def test_baseline_service_extremity_and_disclaimer():
 
     deviations = service.compute_flow_deviations(extreme_features, top_k=3)
     assert len(deviations) > 0
+    # Destination port must be excluded from statistical deviations
+    features_in_devs = [d["feature"].lower() for d in deviations]
+    assert "destination port" not in features_in_devs
+    assert "total fwd packets" in features_in_devs
+    assert "flow duration" in features_in_devs
+
     for dev in deviations:
         assert "feature" in dev
         assert "value" in dev
@@ -67,10 +73,10 @@ async def test_assistant_service_build_prompt_deviations(monkeypatch):
             "unusual": True,
             "deviations": [
                 {
-                    "feature": "Destination Port",
-                    "value": 21.0,
-                    "benign_median": 80.0,
-                    "bracket": "<25th percentile of benign training traffic",
+                    "feature": "Total Fwd Packets",
+                    "value": 5000.0,
+                    "benign_median": 2.0,
+                    "bracket": ">99th percentile of benign training traffic",
                     "disclaimer": DISCLAIMER_TEXT,
                 }
             ],
@@ -85,7 +91,7 @@ async def test_assistant_service_build_prompt_deviations(monkeypatch):
             "score": 0.91,
             "label": "anomaly",
             "unusual": True,
-            "features": {"Destination Port": 49152.0},
+            "features": {"Total Fwd Packets": 5000.0, "Flow Duration": 1.0, "Destination Port": 49152.0},
         },
     ]
 
@@ -115,7 +121,7 @@ async def test_assistant_service_build_prompt_deviations(monkeypatch):
     assert "[flow 101]" in prompt
     assert "Deviations vs. Benign Baseline:" in prompt
     assert DISCLAIMER_TEXT in prompt
-    assert "Destination Port" in prompt
+    assert "Total Fwd Packets" in prompt
 
 
 @pytest.mark.anyio
@@ -186,9 +192,16 @@ async def test_report_service_deterministic_generation(monkeypatch):
     assert report.observed_facts.score_max == 0.88
 
     # Hypotheses & Uncertainties
-    assert any("Horizontal Port Scan" in h for h in report.hypotheses_and_uncertainties)
+    assert any("Vertical Port Scan" in h for h in report.hypotheses_and_uncertainties)
     assert any("Benign Alternative" in h for h in report.hypotheses_and_uncertainties)
     assert any("Statistical Evidence Disclaimer" in h for h in report.hypotheses_and_uncertainties)
+
+    # Verify no raw python list reprs in prose strings
+    for h in report.hypotheses_and_uncertainties:
+        assert "['" not in h
+    for step in report.recommended_next_steps:
+        assert "['" not in step
+    assert "['" not in report.executive_summary
 
     # Next steps (human-in-the-loop)
     assert len(report.recommended_next_steps) >= 3
@@ -258,6 +271,115 @@ def test_incident_report_endpoints(monkeypatch):
         data_post = res_post.json()
         assert data_post["incident_id"] == "inc-rpt-999"
 
+        # GET report in Markdown format
+        res_md = client.get("/api/v1/incidents/inc-rpt-999/report?format=markdown")
+        assert res_md.status_code == 200
+        assert "text/markdown" in res_md.headers.get("content-type", "")
+        md_text = res_md.text
+        assert "# Incident Investigation Report: `inc-rpt-999`" in md_text
+        assert "## 1. Executive Summary" in md_text
+        assert "## 2. Observed Facts" in md_text
+        assert "## 3. Supporting Evidence Flows" in md_text
+        assert "## 4. Hypotheses & Uncertainties" in md_text
+        assert "## 5. Recommended Next Steps" in md_text
+        assert "## 6. Analyst Feedback History" in md_text
+
         # 404 on nonexistent incident
         res_404 = client.get("/api/v1/incidents/nonexistent-id/report")
         assert res_404.status_code == 404
+
+
+def test_feedback_persistence_and_report_integration(monkeypatch):
+    incident_store = {
+        "incident_id": "inc-feedback-test",
+        "upload_id": "up-fb-1",
+        "kinds": ["port_scan"],
+        "start": "2017-07-07 14:30:00",
+        "end": "2017-07-07 14:31:00",
+        "flow_count": 5,
+        "max_score": 0.92,
+        "src_ips": ["172.16.0.1"],
+        "dst_ips": ["192.168.10.50"],
+        "reasons": ["172.16.0.1 contacted 5 distinct ports in 60s"],
+        "status": "open",
+        "latest_decision": None,
+        "feedback": [],
+        "flows": [
+            {
+                "flow_id": 1,
+                "ts": "2017-07-07 14:30:00",
+                "src_ip": "172.16.0.1",
+                "dst_ip": "192.168.10.50",
+                "dst_port": 80,
+                "score": 0.92,
+                "label": "anomaly",
+                "unusual": True,
+                "deviations": [],
+            }
+        ],
+    }
+
+    async def mock_add_feedback(incident_id, decision, note, analyst_id=None, analyst_name=None):
+        if incident_id != incident_store["incident_id"]:
+            return None
+        entry = {
+            "decision": decision,
+            "note": note,
+            "timestamp": "2026-10-17T13:30:00Z",
+            "analyst_id": analyst_id,
+            "analyst_name": analyst_name,
+        }
+        incident_store["feedback"].append(entry)
+        incident_store["latest_decision"] = decision
+        incident_store["status"] = decision
+        return {
+            "incident_id": incident_id,
+            "decision": decision,
+            "note": note,
+            "timestamp": "2026-10-17T13:30:00Z",
+            "feedback_count": len(incident_store["feedback"]),
+            "analyst_id": analyst_id,
+            "analyst_name": analyst_name,
+        }
+
+    async def mock_get_detail(incident_id, skip=0, limit=200):
+        if incident_id == incident_store["incident_id"]:
+            return incident_store
+        return None
+
+    monkeypatch.setattr(correlation_service, "add_feedback", mock_add_feedback)
+    monkeypatch.setattr(correlation_service, "get_incident_detail", mock_get_detail)
+
+    with TestClient(app) as client:
+        # POST feedback
+        payload = {
+            "decision": "confirmed",
+            "notes": "Verified adversarial port scanning activity against web server.",
+            "analyst_id": "analyst-42",
+            "name": "Alex Triage",
+        }
+        fb_res = client.post("/api/v1/incidents/inc-feedback-test/feedback", json=payload)
+        assert fb_res.status_code == 201
+        fb_data = fb_res.json()
+        assert fb_data["decision"] == "confirmed"
+        assert fb_data["note"] == payload["notes"]
+        assert fb_data["analyst_id"] == "analyst-42"
+        assert fb_data["analyst_name"] == "Alex Triage"
+        assert fb_data["feedback_count"] == 1
+
+        # GET report to verify updated feedback history and status
+        rpt_res = client.get("/api/v1/incidents/inc-feedback-test/report")
+        assert rpt_res.status_code == 200
+        rpt_data = rpt_res.json()
+
+        history = rpt_data["analyst_feedback_history"]
+        assert history["current_status"] == "confirmed"
+        assert history["latest_decision"] == "confirmed"
+        assert len(history["feedback_entries"]) == 1
+
+        entry = history["feedback_entries"][0]
+        assert entry["decision"] == "confirmed"
+        assert entry["note"] == "Verified adversarial port scanning activity against web server."
+        assert entry["analyst_id"] == "analyst-42"
+        assert entry["analyst_name"] == "Alex Triage"
+

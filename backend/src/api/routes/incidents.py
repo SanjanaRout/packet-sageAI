@@ -92,22 +92,26 @@ async def get_incident(
     return incident
 
 
+from fastapi.responses import PlainTextResponse
+
+
 @router.get(
     "/{incident_id}/report",
-    response_model=IncidentReportResponse,
+    response_model=Union[IncidentReportResponse, str],
     summary="Get structured incident report",
     description="Generate a structured incident report containing executive summary, observed facts, statistical feature deviations vs. benign baseline, hypotheses and uncertainties, human-in-the-loop next steps, and analyst feedback.",
 )
 @router.post(
     "/{incident_id}/report",
-    response_model=IncidentReportResponse,
+    response_model=Union[IncidentReportResponse, str],
     summary="Generate structured incident report",
     description="Generate a structured incident report containing executive summary, observed facts, statistical feature deviations vs. benign baseline, hypotheses and uncertainties, human-in-the-loop next steps, and analyst feedback.",
 )
 async def get_incident_report(
     incident_id: str,
     generate_llm: bool = Query(default=False, description="Optionally enrich report with LLM synthesis"),
-) -> IncidentReportResponse:
+    format: str = Query(default="json", pattern="^(json|markdown)$", description="Report format: 'json' or 'markdown'"),
+):
     from services.report_service import report_service
 
     report = await report_service.generate_report(
@@ -118,6 +122,8 @@ async def get_incident_report(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident '{incident_id}' not found",
         )
+    if format == "markdown":
+        return PlainTextResponse(content=report.markdown_report or "", media_type="text/markdown")
     return report
 
 
@@ -210,7 +216,9 @@ async def record_feedback(
     res = await correlation_service.add_feedback(
         incident_id=incident_id,
         decision=decision,
-        note=request.note,
+        note=request.get_effective_note(),
+        analyst_id=request.analyst_id,
+        analyst_name=request.get_effective_analyst_name(),
     )
     if not res:
         raise HTTPException(

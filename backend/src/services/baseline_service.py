@@ -22,6 +22,16 @@ logger = logging.getLogger("packet_sage")
 
 DISCLAIMER_TEXT = "statistical deviation from benign baseline (not a causal model explanation / SHAP)"
 
+EXCLUDED_STATISTICAL_FEATURES = {
+    "destination port",
+    "dst_port",
+    "source port",
+    "src_port",
+    "protocol",
+    "flow id",
+    "flow_id",
+}
+
 
 class BaselineService:
     def __init__(self, baseline_path: Optional[str] = None):
@@ -74,6 +84,7 @@ class BaselineService:
     ) -> List[Dict[str, Any]]:
         """
         Compares numeric feature values against benign baseline quantiles.
+        Excludes categorical identifiers (ports, protocol, IDs) to focus on behavioral metrics.
         Returns top_k most extreme features (>= p95 or <= p5), with raw value,
         benign median (p50), percentile bracket, and explicit non-causal disclaimer.
         """
@@ -88,6 +99,8 @@ class BaselineService:
 
         for feat_name, ref in stats.items():
             feat_lower = feat_name.strip().lower()
+            if feat_lower in EXCLUDED_STATISTICAL_FEATURES:
+                continue
             if feat_lower not in input_lower:
                 continue
 

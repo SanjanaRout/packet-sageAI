@@ -46,6 +46,18 @@ class AskIncidentResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     decision: str = Field(description="Analyst decision: confirmed, incorrect, or inconclusive")
     note: str = Field(default="", description="Analyst observations and rationale")
+    notes: str | None = Field(default=None, description="Alias for note")
+    analyst_id: str | None = Field(default=None, description="Optional analyst identifier")
+    name: str | None = Field(default=None, description="Optional analyst name")
+    analyst_name: str | None = Field(default=None, description="Optional analyst name")
+
+    def get_effective_note(self) -> str:
+        if self.notes is not None and self.notes != "":
+            return self.notes
+        return self.note
+
+    def get_effective_analyst_name(self) -> str | None:
+        return self.analyst_name or self.name
 
 
 class FeedbackResponse(BaseModel):
@@ -54,6 +66,8 @@ class FeedbackResponse(BaseModel):
     note: str
     timestamp: str
     feedback_count: int
+    analyst_id: str | None = None
+    analyst_name: str | None = None
 
 
 class LLMStatusResponse(BaseModel):
@@ -108,6 +122,8 @@ class AnalystFeedbackEntry(BaseModel):
     decision: str
     note: str
     timestamp: str
+    analyst_id: str | None = None
+    analyst_name: str | None = None
 
 
 class AnalystFeedbackHistory(BaseModel):
@@ -126,6 +142,7 @@ class IncidentReportResponse(BaseModel):
     hypotheses_and_uncertainties: list[str]
     recommended_next_steps: list[str]
     analyst_feedback_history: AnalystFeedbackHistory
+    markdown_report: str | None = Field(default=None, description="Rendered markdown version of the investigation report")
 
 
 

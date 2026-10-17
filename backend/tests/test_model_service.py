@@ -98,3 +98,23 @@ def test_get_model_service_unloaded_raises_503():
         with pytest.raises(HTTPException) as exc_info:
             get_model_service()
         assert exc_info.value.status_code == 503
+
+
+def test_get_model_metrics_endpoint():
+    from fastapi.testclient import TestClient
+    from app import app
+
+    model_service.load()
+    with TestClient(app) as client:
+        res = client.get("/api/v1/model/metrics")
+        assert res.status_code == 200
+        data = res.json()
+        assert "decision_threshold" in data
+        assert 0.12 < data["decision_threshold"] < 0.13
+        assert data["precision"] > 0.95
+        assert data["recall"] > 0.95
+        assert data["f1_score"] > 0.95
+        assert 0.0 <= data["false_positive_rate"] < 0.05
+        assert "novelty_threshold" in data
+        assert data["features_count"] == 78
+

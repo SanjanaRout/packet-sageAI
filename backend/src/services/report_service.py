@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
+from core.database import mongodb
 from schemas.incident import (
     AnalystFeedbackEntry,
     AnalystFeedbackHistory,
@@ -61,6 +63,35 @@ class ReportService:
             dst_ips = list(incident.get("dst_ips", []))
 
         dst_ports = sorted(list({f["dst_port"] for f in raw_flows if f.get("dst_port") is not None}))
+
+        # Determine true distinct port count across the whole incident:
+        # 1. Start from preview flows
+        true_port_count = len(dst_ports)
+
+        # 2. Extract port count from incident correlation reasons if present (e.g. "contacted 29689 distinct ports")
+        for r in reasons:
+            m = re.search(r"contacted\s+(\d+)\s+distinct\s+ports", r, re.IGNORECASE)
+            if m:
+                true_port_count = max(true_port_count, int(m.group(1)))
+
+        # 3. Query distinct ports from MongoDB if flows collection is available
+        flow_ids = incident.get("flow_ids", [])
+        if mongodb.is_connected and flow_ids and upload_id != "unknown":
+            try:
+                flows_coll = mongodb.get_collection("flows")
+                distinct_ports = await flows_coll.distinct(
+                    "dst_port",
+                    {"upload_id": upload_id, "flow_id": {"$in": flow_ids}}
+                )
+                if distinct_ports:
+                    true_port_count = max(true_port_count, len(distinct_ports))
+            except Exception:
+                pass
+
+        # Clean prose representations (no Python list reprs)
+        src_ips_str = ", ".join(src_ips[:3]) if src_ips else "Unknown Source"
+        dst_ips_str = ", ".join(dst_ips[:3]) if dst_ips else "Unknown Target"
+        dst_ports_str = ", ".join(str(p) for p in dst_ports[:5]) if dst_ports else "N/A"
 
         time_metadata_note = (
             "Source timestamps lack native AM/PM tags. 12-hour business-hours clock shift WAS applied "
@@ -129,6 +160,8 @@ class ReportService:
                 decision=str(fb.get("decision", "unknown")),
                 note=str(fb.get("note", "")),
                 timestamp=str(fb.get("timestamp", "")),
+                analyst_id=str(fb.get("analyst_id")) if fb.get("analyst_id") else None,
+                analyst_name=str(fb.get("analyst_name")) if fb.get("analyst_name") else None,
             )
             for fb in feedback_raw
         ]
@@ -142,17 +175,34 @@ class ReportService:
         # Hypotheses and Uncertainties
         hypotheses: List[str] = []
         if "port_scan" in kinds:
-            hypotheses.append(
-                f"Horizontal Port Scan: Concentrated connection pattern from {src_ips[:1]} contacting {len(dst_ports)} "
-                f"distinct ports within a short tumbling window is characteristic of active network reconnaissance or vulnerability discovery."
-            )
+            if len(dst_ips) <= 1:
+                scan_type = "Vertical Port Scan"
+                scan_desc = (
+                    f"Concentrated connection pattern from {src_ips_str} contacting {true_port_count} "
+                    f"distinct port(s) on target {dst_ips_str} within a short tumbling window is characteristic "
+                    "of active host-level service enumeration or vulnerability discovery."
+                )
+            elif true_port_count <= 5:
+                scan_type = "Horizontal Sweep"
+                scan_desc = (
+                    f"Connection sweep from {src_ips_str} targeting {len(dst_ips)} destination IP(s) across "
+                    f"{true_port_count} port(s) ({dst_ports_str}) is characteristic of broad network reconnaissance "
+                    "seeking specific open services across subnets."
+                )
+            else:
+                scan_type = "Hybrid / Multi-Target Port Scan"
+                scan_desc = (
+                    f"Broad connection pattern from {src_ips_str} targeting {len(dst_ips)} destination IP(s) across "
+                    f"{true_port_count} distinct ports is characteristic of comprehensive network mapping."
+                )
+            hypotheses.append(f"{scan_type}: {scan_desc}")
             hypotheses.append(
                 "Benign Alternative: Network monitoring sweep, authorized security scanner (e.g. Nessus, Qualys), "
                 "or client application initiating parallel ephemeral connections."
             )
         if "fan_in" in kinds:
             hypotheses.append(
-                f"Distributed Fan-In: Multiple distinct source IPs targeting {dst_ips[:1]} matches distributed denial-of-service (DDoS) "
+                f"Distributed Fan-In: Multiple distinct source IPs targeting {dst_ips_str} matches distributed denial-of-service (DDoS) "
                 "or distributed credential stuffing activity."
             )
             hypotheses.append(
@@ -175,8 +225,8 @@ class ReportService:
 
         # Recommended Next Steps (Human-reviewed, no autonomous blocking)
         next_steps = [
-            f"Verify whether source IP(s) {src_ips[:3]} correspond to known internal vulnerability scanners, inventory systems, or authorized automation.",
-            f"Review destination server authentication and web server logs on port(s) {dst_ports[:5]} for anomalous HTTP status codes or unauthorized access attempts.",
+            f"Verify whether source IP(s) {src_ips_str} correspond to known internal vulnerability scanners, inventory systems, or authorized automation.",
+            f"Review destination server authentication and web server logs on port(s) {dst_ports_str} for anomalous HTTP status codes or unauthorized access attempts.",
             "Inspect perimeter firewall and NetFlow session state to determine if TCP handshakes completed (SYN-ACK / ESTABLISHED) or were dropped.",
             "Cross-reference source and destination hosts against Endpoint Detection & Response (EDR) telemetry to inspect originating process binaries.",
             f"Record analyst triage findings (confirmed threat, false positive, or inconclusive) via POST /api/v1/incidents/{incident_id}/feedback.",
@@ -192,8 +242,8 @@ class ReportService:
         executive_summary = (
             f"Incident {incident_id} encompasses {flow_count} network flow(s) observed between {start} and {end}, "
             f"triggering correlation rule(s): {', '.join(kinds)}. Activity involved {len(src_ips)} source IP(s) "
-            f"({', '.join(src_ips[:3])}) contacting {len(dst_ips)} target IP(s) ({', '.join(dst_ips[:3])}) across "
-            f"{len(dst_ports)} destination port(s). Peak anomaly score reached {score_max:.4f} "
+            f"({src_ips_str}) contacting {len(dst_ips)} target IP(s) ({dst_ips_str}) across "
+            f"{true_port_count} destination port(s). Peak anomaly score reached {score_max:.4f} "
             f"(supervised threshold {getattr(model_service, 'threshold', 0.127):.4f}).{dev_text}"
         )
 
@@ -210,10 +260,11 @@ class ReportService:
             except Exception as exc:
                 logger.warning("Optional LLM report generation failed; fallback to deterministic report: %s", exc)
 
-        return IncidentReportResponse(
+        gen_time = datetime.now(timezone.utc).isoformat()
+        markdown_text = self.render_markdown_report(
             incident_id=incident_id,
             upload_id=upload_id,
-            generated_at=datetime.now(timezone.utc).isoformat(),
+            generated_at=gen_time,
             executive_summary=executive_summary,
             observed_facts=observed_facts,
             supporting_evidence=supporting_flows,
@@ -221,6 +272,103 @@ class ReportService:
             recommended_next_steps=next_steps,
             analyst_feedback_history=analyst_history,
         )
+
+        return IncidentReportResponse(
+            incident_id=incident_id,
+            upload_id=upload_id,
+            generated_at=gen_time,
+            executive_summary=executive_summary,
+            observed_facts=observed_facts,
+            supporting_evidence=supporting_flows,
+            hypotheses_and_uncertainties=hypotheses,
+            recommended_next_steps=next_steps,
+            analyst_feedback_history=analyst_history,
+            markdown_report=markdown_text,
+        )
+
+    def render_markdown_report(
+        self,
+        incident_id: str,
+        upload_id: str,
+        generated_at: str,
+        executive_summary: str,
+        observed_facts: ObservedFacts,
+        supporting_evidence: List[SupportingEvidenceFlow],
+        hypotheses_and_uncertainties: List[str],
+        recommended_next_steps: List[str],
+        analyst_feedback_history: AnalystFeedbackHistory,
+    ) -> str:
+        md = []
+        md.append(f"# Incident Investigation Report: `{incident_id}`\n")
+        md.append(f"- **Upload ID:** `{upload_id}`")
+        md.append(f"- **Generated At:** {generated_at}")
+        md.append(f"- **Current Status:** `{analyst_feedback_history.current_status}`")
+        if analyst_feedback_history.latest_decision:
+            md.append(f"- **Latest Decision:** `{analyst_feedback_history.latest_decision}`")
+        md.append(f"- **Time Window:** {observed_facts.time_window}")
+        md.append(f"- **Rules Triggered:** {', '.join(observed_facts.rules_triggered)}")
+        md.append(f"- **Clock Shift Applied:** {'Yes' if observed_facts.time_shift_applied else 'No'}")
+        md.append(f"- **Time Metadata Note:** {observed_facts.time_metadata_note}\n")
+
+        md.append("## 1. Executive Summary\n")
+        md.append(f"{executive_summary}\n")
+
+        md.append("## 2. Observed Facts\n")
+        md.append(f"- **Source IPs ({len(observed_facts.src_ips)}):** {', '.join(observed_facts.src_ips) or 'N/A'}")
+        md.append(f"- **Target Destination IPs ({len(observed_facts.dst_ips)}):** {', '.join(observed_facts.dst_ips) or 'N/A'}")
+        md.append(f"- **Sample Destination Ports:** {', '.join(str(p) for p in observed_facts.dst_ports) or 'N/A'}")
+        md.append(f"- **Total Flow Count:** {observed_facts.flow_count}")
+        md.append(f"- **Score Range:** {observed_facts.score_min:.4f} to {observed_facts.score_max:.4f}")
+        md.append("- **Trigger Reasons:**")
+        for r in observed_facts.reasons:
+            md.append(f"  - {r}")
+
+        if observed_facts.top_feature_deviations:
+            md.append("\n### Top Statistical Feature Deviations vs. Benign Baseline")
+            md.append("| Feature | Observed Value | Benign Median (p50) | Percentile Bracket |")
+            md.append("| :--- | :--- | :--- | :--- |")
+            for dev in observed_facts.top_feature_deviations:
+                md.append(f"| `{dev['feature']}` | {dev['value']} | {dev['benign_median']} | {dev['bracket']} |")
+            md.append("\n> **Notice:** *Statistical deviations represent differences from the benign training distribution, not causal explanations or SHAP attributions.*\n")
+
+        md.append("## 3. Supporting Evidence Flows\n")
+        if supporting_evidence:
+            md.append("| Flow ID | Timestamp | Source IP | Destination IP:Port | Score | Label | Unusual | Top Behavioral Deviations |")
+            md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for f in supporting_evidence[:20]:
+                dev_snips = "; ".join(f"{d['feature']}={d['value']} ({d['bracket']})" for d in f.deviations[:2]) if f.deviations else "None"
+                dst_port_str = str(f.dst_port) if f.dst_port is not None else "N/A"
+                score_str = f"{f.score:.4f}" if f.score is not None else "N/A"
+                md.append(f"| `{f.flow_id}` | {f.ts or 'N/A'} | `{f.src_ip or 'N/A'}` | `{f.dst_ip or 'N/A'}:{dst_port_str}` | {score_str} | {f.label or 'N/A'} | {'Yes' if f.unusual else 'No'} | {dev_snips} |")
+            md.append("")
+        else:
+            md.append("No supporting flows available.\n")
+
+        md.append("## 4. Hypotheses & Uncertainties\n")
+        for h in hypotheses_and_uncertainties:
+            md.append(f"- {h}")
+        md.append("")
+
+        md.append("## 5. Recommended Next Steps\n")
+        md.append("> **Operational Guidance:** Actions below are analyst-reviewed advisory steps. Autonomous blocking is not performed.\n")
+        for idx, step in enumerate(recommended_next_steps, 1):
+            md.append(f"{idx}. {step}")
+        md.append("")
+
+        md.append("## 6. Analyst Feedback History\n")
+        md.append(f"- **Current Status:** `{analyst_feedback_history.current_status}`")
+        md.append(f"- **Latest Decision:** `{analyst_feedback_history.latest_decision or 'None'}`\n")
+        if analyst_feedback_history.feedback_entries:
+            md.append("| Timestamp | Decision | Analyst | Notes |")
+            md.append("| :--- | :--- | :--- | :--- |")
+            for fb in analyst_feedback_history.feedback_entries:
+                analyst = fb.analyst_name or fb.analyst_id or "Unspecified"
+                md.append(f"| {fb.timestamp} | `{fb.decision}` | {analyst} | {fb.note} |")
+            md.append("")
+        else:
+            md.append("No analyst feedback recorded yet.\n")
+
+        return "\n".join(md)
 
 
 report_service = ReportService()
